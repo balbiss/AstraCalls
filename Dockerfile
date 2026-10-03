@@ -4,6 +4,9 @@
 # Os assets do client são JS/HTML estáticos (independem de arquitetura); fixamos
 # em $BUILDPLATFORM para NÃO rodar o node emulado (QEMU) num build arm64 — isso
 # acelera o build multi-arch e reduz muito o uso de disco.
+# Default p/ o builder clássico (ex.: build via API do Portainer), que não injeta
+# BUILDPLATFORM; o buildx sobrescreve com o valor real.
+ARG BUILDPLATFORM=linux/amd64
 FROM --platform=$BUILDPLATFORM node:22-bookworm AS client
 WORKDIR /app/client
 COPY client/package*.json ./
