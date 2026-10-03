@@ -180,36 +180,41 @@ func (s *server) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "audio_url ou audio_base64 obrigatório (no vídeo, é o próprio arquivo de vídeo)"})
 		return
 	}
-	media, err := fetchMedia(b.AudioBase64, b.AudioURL)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "baixar mídia: " + err.Error()})
-		return
-	}
-	// grava num arquivo temporário (MP4 etc. não decodificam por pipe).
-	mpath, cleanup, err := mediaToTemp(media)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "arquivo temp: " + err.Error()})
-		return
-	}
-	defer cleanup()
-	// áudio: no disparo de vídeo é opcional (o arquivo pode não ter faixa de áudio).
-	pcm, err := decodePCM16(mpath)
-	if err != nil && !b.Video {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if !b.Video && len(pcm) < bcFrameSamples {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "áudio vazio/curto demais"})
-		return
-	}
-	// vídeo: decodifica os frames H264 do mesmo arquivo.
-	var frames []vframe
-	if b.Video {
-		frames, err = decodeVideoFrames(mpath, b.videoOpts())
+	// mídia já decodificada recentemente (mesma audio_url/opções) → pula download + ffmpeg
+	cacheKey := bcCacheKey(b)
+	pcm, frames, hit := bcCacheGet(cacheKey)
+	if !hit {
+		media, err := fetchMedia(b.AudioBase64, b.AudioURL)
 		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "baixar mídia: " + err.Error()})
+			return
+		}
+		// grava num arquivo temporário (MP4 etc. não decodificam por pipe).
+		mpath, cleanup, err := mediaToTemp(media)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "arquivo temp: " + err.Error()})
+			return
+		}
+		defer cleanup()
+		// áudio: no disparo de vídeo é opcional (o arquivo pode não ter faixa de áudio).
+		pcm, err = decodePCM16(mpath)
+		if err != nil && !b.Video {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		if !b.Video && len(pcm) < bcFrameSamples {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "áudio vazio/curto demais"})
+			return
+		}
+		// vídeo: decodifica os frames H264 do mesmo arquivo.
+		if b.Video {
+			frames, err = decodeVideoFrames(mpath, b.videoOpts())
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+		}
+		bcCachePut(cacheKey, pcm, frames)
 	}
 
 	camp := &broadcastCampaign{
