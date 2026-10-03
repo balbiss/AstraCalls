@@ -99,6 +99,25 @@ func (s *Socket) ResolveLIDForPN(ctx context.Context, pn types.JID) types.JID {
 	if pn.Server == types.HiddenUserServer {
 		return pn
 	}
+	// AUTORITATIVO primeiro: IsOnWhatsApp devolve o LID canônico ATUAL do número e
+	// atualiza o store. O mapa local (GetLIDForPN) pode estar STALE/ERRADO — já vimos
+	// ele devolver um LID sem dispositivos, e o offer de chamada ia pro LID errado →
+	// o destino NÃO tocava (bug 02/10). Resolver pelo servidor garante o LID certo.
+	if s.cli != nil {
+		if resp, err := s.cli.IsOnWhatsApp(ctx, []string{pn.User}); err == nil {
+			for _, r := range resp {
+				if r.IsIn && r.JID.Server == types.HiddenUserServer && !r.JID.IsEmpty() {
+					// Grava o par PN<->LID no store. Além de ajudar a resolução futura,
+					// é o que faz o espelhamento do TC token (privacy token) funcionar no
+					// SQL (whatsmeow_lid_map) — ter o token sob um dos JIDs e o par
+					// mapeado evita o 463/shadow-ban no envio de mensagem.
+					s.cli.StoreLIDPNMapping(ctx, r.JID, pn)
+					return r.JID
+				}
+			}
+		}
+	}
+	// fallback: store local, depois o próprio PN.
 	if s.cli.Store != nil && s.cli.Store.LIDs != nil {
 		if lid, err := s.cli.Store.LIDs.GetLIDForPN(ctx, pn); err == nil && !lid.IsEmpty() {
 			return lid

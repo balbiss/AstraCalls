@@ -38,13 +38,14 @@ const (
 	mlowChannels        = 1
 	opusApplicationVOIP = 2048
 
-	ctlSetBitrate    = 4002
-	ctlSetComplexity = 4010
-	ctlSetSignal     = 4024
-	ctlSetInbandFEC  = 4012
-	ctlSetDTX        = 4016
-	ctlSetUsingSmpl  = 4050
-	ctlSignalVoice   = 3001
+	ctlSetBitrate        = 4002
+	ctlSetComplexity     = 4010
+	ctlSetSignal         = 4024
+	ctlSetInbandFEC      = 4012
+	ctlSetPacketLossPerc = 4014
+	ctlSetDTX            = 4016
+	ctlSetUsingSmpl      = 4050
+	ctlSignalVoice       = 3001
 
 	mlowMaxOut = 5760
 )
@@ -54,7 +55,13 @@ var globalInitOnce sync.Once
 type mlowCodec struct {
 	encoder unsafe.Pointer
 	decoder unsafe.Pointer
+	// redundancy > 0 habilita o desempacotamento SplitRed/RED. Fica 0 (desligado)
+	// até a negociação ser lida; rodar RED num frame nu corromperia o áudio.
+	redundancy int
 }
+
+// SetRedundancy liga/desliga o desempacotamento RED (nível negociado da chamada).
+func (c *mlowCodec) SetRedundancy(n int) { c.redundancy = n }
 
 func NewMLowCodec(opts CodecOptions) (Codec, error) {
 	if opts.Bitrate == 0 {
@@ -88,6 +95,10 @@ func NewMLowCodec(opts CodecOptions) (Codec, error) {
 		fec = 1
 	}
 	C.mlow_enc_ctl(c.encoder, C.int(ctlSetInbandFEC), C.int(fec))
+	if opts.FEC {
+		// FEC só é útil se o encoder sabe a perda esperada (redundância dimensionada).
+		C.mlow_enc_ctl(c.encoder, C.int(ctlSetPacketLossPerc), C.int(10))
+	}
 	C.mlow_enc_ctl(c.encoder, C.int(ctlSetDTX), C.int(1))
 
 	return c, nil
@@ -119,6 +130,43 @@ func (c *mlowCodec) Encode(pcm []float32) ([]byte, error) {
 }
 
 func (c *mlowCodec) Decode(frame []byte) ([]float32, error) {
+	if len(frame) == 0 {
+		return c.decodeBare(nil), nil
+	}
+	// Container multi-frame 0x92 (chamada de vídeo com DTX): o WhatsApp junta vários
+	// frames MLow de 60ms num payload só. Decodifica cada sub-frame nu e concatena —
+	// senão o header 0x92 vira "ruído" e a voz some. Aplicado sempre (marcador distinto).
+	if subs, ok := splitContainer(frame); ok {
+		if MLowDebug != nil {
+			MLowDebug("mlow container 0x92", "sub_frames", len(subs), "bytes", len(frame))
+		}
+		var out []float32
+		for _, sf := range subs {
+			out = append(out, c.decodeBare(sf)...)
+		}
+		if len(out) == 0 {
+			return make([]float32, mlowFrameSize), nil
+		}
+		return out, nil
+	}
+	// SplitRed/RED (só quando a redundância foi negociada): decodifica o frame principal.
+	if c.redundancy > 0 {
+		if main, ok := depackSplitRedMain(frame); ok {
+			if MLowDebug != nil {
+				MLowDebug("mlow RED", "bytes", len(frame), "main_bytes", len(main))
+			}
+			return c.decodeBare(main), nil
+		}
+	}
+	return c.decodeBare(frame), nil
+}
+
+// decodeBare decodifica UM frame MLow nu (TOC + corpo) via opus_decode (caminho SMPL).
+// Devolve silêncio de 60ms em falha (nunca erro), igual ao comportamento histórico.
+func (c *mlowCodec) decodeBare(frame []byte) []float32 {
+	if len(frame) == 0 {
+		frame = nil // frame vazio -> PLC/silêncio
+	}
 	out := make([]C.int16_t, mlowMaxOut)
 	var n C.int
 	if frame == nil {
@@ -128,13 +176,13 @@ func (c *mlowCodec) Decode(frame []byte) ([]float32, error) {
 		n = C.opus_decode(c.decoder, cdata, C.int32_t(len(frame)), &out[0], C.int(mlowMaxOut), 0)
 	}
 	if n <= 0 {
-		return make([]float32, mlowFrameSize), nil
+		return make([]float32, mlowFrameSize)
 	}
 	res := make([]float32, int(n))
 	for i := 0; i < int(n); i++ {
 		res[i] = float32(int16(out[i])) / 32768.0
 	}
-	return res, nil
+	return res
 }
 
 func (c *mlowCodec) FrameSize() int  { return mlowFrameSize }
