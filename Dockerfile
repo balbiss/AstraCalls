@@ -68,4 +68,5 @@ COPY --from=server /astracalls-passkey.zip /app/client/dist/astracalls-passkey.z
 WORKDIR /app
 EXPOSE 8080 50000
 ENTRYPOINT ["wacalls"]
-CMD ["-addr", ":8080", "-static", "/app/client/dist", "-db", "/data/wacalls.db"]
+# -db foi removido do servidor (storage agora é Postgres via WACALLS_PG_URL)
+CMD ["-addr", ":8080", "-static", "/app/client/dist"]

@@ -1,0 +1,94 @@
+# AstraCalls — stack para Portainer (Docker Swarm + Traefik)
+#
+# Por que rede de HOST: a mídia WebRTC precisa enxergar a interface real do
+# servidor (IP público + porta UDP fixa). Por isso o Traefik não alcança o
+# serviço pela rede overlay; um proxy `socat` (na rede do Traefik) repassa o
+# HTTP para o servidor, que escuta só no gateway do docker_gwbridge
+# (172.18.0.1) — ou seja, a porta HTTP NÃO fica exposta na internet.
+#
+# Variáveis (aba "Environment variables" do Portainer):
+#   ASTRACALLS_DOMAIN    ex.: calls.inoovaweb.com.br
+#   ASTRACALLS_IMAGE     ex.: ghcr.io/balbiss/astracalls:latest
+#   PG_PASSWORD          senha forte do Postgres
+#   WACALLS_API_KEY      chave-mestra da API/painel (forte)
+#   WACALLS_WIDGET_KEY   chave restrita do widget do Chatwoot (opcional)
+#   MEDIA_PORT           porta de mídia UDP+TCP (padrão 50000) — liberar no firewall da VPS
+#
+# Firewall da VPS: liberar MEDIA_PORT em UDP **e** TCP (o TCP é o fallback ICE-TCP).
+
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    # host network + listen só em 127.0.0.1: acessível pelo servidor, invisível de fora
+    command: ["postgres", "-c", "listen_addresses=127.0.0.1", "-c", "port=5439"]
+    environment:
+      POSTGRES_USER: astracalls
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - astracalls_pg:/var/lib/postgresql/data
+    networks:
+      - hostnet
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+
+  server:
+    image: ${ASTRACALLS_IMAGE:-ghcr.io/balbiss/astracalls:latest}
+    command: ["-addr", "172.18.0.1:8095", "-static", "/app/client/dist"]
+    environment:
+      # usuário dono do cluster -> tem CREATEDB (1 banco por sessão)
+      WACALLS_PG_URL: postgres://astracalls:${PG_PASSWORD}@127.0.0.1:5439/postgres?sslmode=disable
+      WACALLS_PG_NAMESPACE: wacalls
+      WACALLS_API_KEY: ${WACALLS_API_KEY}
+      WACALLS_WIDGET_KEY: ${WACALLS_WIDGET_KEY:-}
+      WACALLS_PUBLIC_IP: auto
+      WACALLS_UDP_PORT: ${MEDIA_PORT:-50000}
+      WACALLS_MAX_CALLS: "8"
+      WACALLS_PUBLIC_BASE_URL: https://${ASTRACALLS_DOMAIN}
+      WACALLS_RECORDING_DIR: /data/recordings
+    volumes:
+      - astracalls_recordings:/data/recordings
+    networks:
+      - hostnet
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      restart_policy:
+        condition: any
+        delay: 5s
+
+  proxy:
+    image: alpine/socat:latest
+    command: ["TCP-LISTEN:8080,fork,reuseaddr", "TCP:172.18.0.1:8095"]
+    networks:
+      - inoovawebpro
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.astracalls.rule=Host(`${ASTRACALLS_DOMAIN}`)
+        - traefik.http.routers.astracalls.entrypoints=websecure
+        - traefik.http.routers.astracalls.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.astracalls.service=astracalls
+        - traefik.http.services.astracalls.loadbalancer.server.port=8080
+        - traefik.docker.network=inoovawebpro
+        # SSE (eventos em tempo real) não pode ser bufferizado
+        - traefik.http.services.astracalls.loadbalancer.responseforwarding.flushinterval=100ms
+
+volumes:
+  astracalls_pg:
+  astracalls_recordings:
+
+networks:
+  hostnet:
+    external: true
+    name: host
+  inoovawebpro:
+    external: true
