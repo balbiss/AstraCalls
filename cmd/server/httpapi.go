@@ -806,6 +806,15 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.broker.emitIncomingClaimed(sess.id, id, owner)
+	// Body opcional {"record":true}: liga a gravação NESTA chamada no momento do
+	// atendimento (a gravação por sessão é decidida quando a oferta chega).
+	var acc struct {
+		Record bool `json:"record"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&acc)
+	if acc.Record && ac.recorder == nil {
+		ac.recorder = newCallRecorder(id, s.log, time.Now())
+	}
 	if err := ac.cm.AcceptCall(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
